@@ -1,0 +1,194 @@
+/**
+ * Webhook de recepción de mensajes de WhatsApp (vía Twilio)
+ * Procesa el mensaje, extrae los datos de entrenamiento y
+ * los registra en la hoja "datos" de Google Sheets.
+ */
+
+function doPost(e) {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var sheet = ss.getSheetByName("datos");
+
+  // Cuerpo del mensaje enviado por WhatsApp
+  var rawMessage = e.parameter.Body;
+
+  // Normalización: quitamos tildes y pasamos a minúsculas
+  var message = rawMessage
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+
+  try {
+    // 1. EXTRACCIÓN DE FECHA Y PESO
+    var fechaMatch = message.match(/(\d{1,2}\/\d{1,2})/);
+    var pesoMatch = message.match(/(\d+\.?\d*)\s*kg/);
+
+    if (!fechaMatch || !pesoMatch) {
+      return ContentService.createTextOutput(
+        "Formato inválido.\nEjemplo: 25/12 prensa 100kg pierna A 10 10 12 rir 2"
+      );
+    }
+
+    var fechaStr = fechaMatch[1];
+    var peso = parseFloat(pesoMatch[1]);
+
+    // 2. EXTRACCIÓN DE RIR (INTENSIDAD)
+    var rirMatch = message.match(/rir[:\s]*([0-9]+)/);
+    var rir = rirMatch ? parseInt(rirMatch[1]) : "N/A";
+
+    // 3. AISLAMIENTO DEL NOMBRE DEL EJERCICIO
+    var ejercicio = message
+      .split(fechaStr)[1]
+      .split(pesoMatch[0])[0]
+      .trim()
+      .toUpperCase();
+
+    // 4. MAPEO A GRUPO MUSCULAR
+    var grupo = "OTRO";
+    var ej = ejercicio.toLowerCase();
+
+    // Priorizar ejercicios de pierna para no confundir "curl de pierna" con bíceps
+    if (/prensa|smith|bulgara|cuadricep|sentadilla|hack|ext.*pierna/.test(ej)) {
+      grupo = "CUADRICEPS";
+    } else if (
+      /rumano|muerto|isquio|femoral|aductor|curl.*sentado|curl.*echado|pierna/.test(
+        ej
+      )
+    ) {
+      grupo = "ISQUIOSURALES";
+    } else if (/gluteo|hip thrust|abductor|patada|puente/.test(ej)) {
+      grupo = "GLUTEOS";
+    } else if (/banca|pecho|apertura|pec deck|flexion/.test(ej)) {
+      grupo = "PECHO";
+    } else if (/jalon|remo|dorsal|espalda|trapecio|dominada/.test(ej)) {
+      grupo = "ESPALDA";
+    } else if (/militar|hombro|lateral|posterior|deltoide/.test(ej)) {
+      grupo = "DELTOIDES";
+    } else if (/tricep|frances|fondos/.test(ej)) {
+      grupo = "TRICEPS";
+    } else if (/bicep|curl|martillo/.test(ej)) {
+      grupo = "BICEPS";
+    } else if (/pantorrilla|gemelo|talon/.test(ej)) {
+      grupo = "PANTORRILLAS";
+    } else if (/abdomen|core|crunch|plank/.test(ej)) {
+      grupo = "ABDOMEN";
+    }
+
+    // 5. IDENTIFICACIÓN DE SESIÓN (A / B / GENERAL)
+    var sesion = "GENERAL";
+    if (
+      message.includes("sesion a") ||
+      message.includes("pierna a") ||
+      message.includes("torso a")
+    ) {
+      sesion = "SESION A";
+    } else if (
+      message.includes("sesion b") ||
+      message.includes("pierna b") ||
+      message.includes("torso b")
+    ) {
+      sesion = "SESION B";
+    }
+
+    // 6. CONTEO DE SERIES (NÚMERO DE SERIES Y REPS POR SERIE)
+    var todosLosNumeros = message.match(/\b\d+\b/g);
+    var numFecha = fechaStr.split("/");
+
+    var reps = [];
+    todosLosNumeros.forEach(function (num) {
+      // Filtrar: día, mes, peso y RIR no deben contarse como repeticiones
+      if (
+        num !== numFecha[0] &&
+        num !== numFecha[1] &&
+        num !== pesoMatch[1] &&
+        (!rirMatch || num !== rirMatch[1])
+      ) {
+        reps.push(parseInt(num, 10));
+      }
+    });
+
+    var n_series = reps.length;
+    var s1 = reps[0] || 0;
+    var s2 = reps[1] || 0;
+    var s3 = reps[2] || 0; // Si solo hay 2 series, la tercera queda en 0
+
+    // 7. CÁLCULO DE ACUMULADOS (SESION Y SEMANA)
+    var datos = sheet.getDataRange().getValues();
+    var vol_sesion = n_series; // volumen = nº de series por grupo en ese día
+    var vol_semanal = n_series;
+
+    // Se usa año fijo (2025) para calcular la semana ISO, tomando día/mes del mensaje
+    var fechaObj = new Date(
+      2025,
+      parseInt(numFecha[1], 10) - 1,
+      parseInt(numFecha[0], 10)
+    );
+    var numSemana = getWeekNumber(fechaObj);
+
+    for (var i = 1; i < datos.length; i++) {
+      if (!datos[i][1]) continue; // si no hay fecha, saltar
+
+      var fGuardada = String(datos[i][1]).split("/");
+      if (fGuardada.length !== 2) continue;
+
+      var fGuardadaObj = new Date(
+        2025,
+        parseInt(fGuardada[1], 10) - 1,
+        parseInt(fGuardada[0], 10)
+      );
+
+      // L: sumar series del mismo grupo en la misma fecha
+      if (datos[i][1] === fechaStr && datos[i][3] === grupo) {
+        vol_sesion += Number(datos[i][5]);
+      }
+
+      // M: sumar series del mismo grupo en la misma semana (A + B)
+      if (getWeekNumber(fGuardadaObj) === numSemana && datos[i][3] === grupo) {
+        vol_semanal += Number(datos[i][5]);
+      }
+    }
+
+    // 8. REGISTRO EN LA HOJA "datos"
+    sheet.appendRow([
+      new Date(), // A: Timestamp
+      fechaStr, // B: Fecha (dd/mm)
+      ejercicio, // C: Ejercicio
+      grupo, // D: Grupo muscular
+      sesion, // E: Sesión
+      n_series, // F: Nº Series
+      peso, // G: Peso (kg)
+      rir, // H: RIR
+      s1, // I: Serie 1
+      s2, // J: Serie 2
+      s3, // K: Serie 3
+      vol_sesion, // L: Volumen por sesión (acumulado día)
+      vol_semanal // M: Volumen semanal (acumulado semana)
+    ]);
+
+    // 9. RESPUESTA AL USUARIO (WhatsApp)
+    var respuesta =
+      "REGISTRO GUARDADO\n" +
+      ejercicio +
+      " (" +
+      grupo +
+      ")\n" +
+      "Series hoy (mismo grupo): " +
+      vol_sesion +
+      "\n" +
+      "Series esta semana (mismo grupo): " +
+      vol_semanal;
+
+    return ContentService.createTextOutput(respuesta);
+  } catch (err) {
+    return ContentService.createTextOutput("Error procesando el mensaje.");
+  }
+}
+
+/**
+ * Calcula el número de semana ISO 8601 para una fecha dada.
+ */
+function getWeekNumber(d) {
+  d = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  d.setUTCDate(d.getUTCDate() + 4 - (d.getUTCDay() || 7));
+  var yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  return Math.ceil(((d - yearStart) / 86400000 + 1) / 7);
+}
